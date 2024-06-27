@@ -5,6 +5,7 @@ import torch
 import heapq
 import random
 import threading
+import pynvml
 from torchvision import transforms, datasets
 from torch.utils.data import DataLoader
 from deap import base, creator, tools, algorithms
@@ -108,6 +109,29 @@ def moea(task, models_dir):
     task.variant = best_model['variant']
     return best_model['variant']
 
+def check_gpu_resources(threshold=0.8):
+    """
+    Checks if the GPU memory and utilization are below the given threshold.
+
+    :param threshold: A float representing the maximum allowed usage (default is 0.8, i.e., 80%)
+    :return: True if GPU memory and utilization are below the threshold, False otherwise
+    """
+    pynvml.nvmlInit()
+    device_count = pynvml.nvmlDeviceGetCount()
+    for i in range(device_count):
+        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        util_info = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        total_memory = mem_info.total
+        used_memory = mem_info.used
+        memory_usage = used_memory / total_memory
+        gpu_utilization = util_info.gpu / 100.0
+        if memory_usage < threshold and gpu_utilization < threshold:
+            pynvml.nvmlShutdown()
+            return True  # At least one GPU meets the criteria
+    pynvml.nvmlShutdown()
+    return False  # No GPU meets the criteria
+
 def monitor_scheduler(start_time, task_waitlist, task_scheduler_queue, interval=10):
     while True:
         current_time = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -158,6 +182,8 @@ def execute_task(task, models_dir, results_file, scheduler_start_time, high_prio
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(results)
 
+    return task  # Return the task after processing
+
 def read_task_definitions(csv_file_path):
     tasks = []
     with open(csv_file_path, 'r') as file:
@@ -177,6 +203,7 @@ def main(task_definitions_file, models_dir, results_file):
     task_scheduler_queue = []
     results = []
 
+    # Initialize results file with headers for the task execution results
     # Initialize results file with headers for the task execution results
     with open(results_file, 'w', newline='') as csvfile:
         fieldnames = ['task_id', 'model_type', 'dataset', 'batch_size', 'start_time', 'actual_start_time', 'deadline', 'elapsed_time_ms', 'missed_deadline', 'model_variant', 'data_size']
@@ -208,11 +235,16 @@ def main(task_definitions_file, models_dir, results_file):
             # Check GPU resources and execute tasks
             if task_scheduler_queue:
                 next_task = heapq.heappop(task_scheduler_queue)
-                futures.append(executor.submit(execute_task, next_task, models_dir, results_file, scheduler_start_time, high_priority_stream, low_priority_stream))
+                if check_gpu_resources():  # Only execute task if GPU resources are available
+                    futures.append(executor.submit(execute_task, next_task, models_dir, results_file, scheduler_start_time, high_priority_stream, low_priority_stream))
+                else:
+                    heapq.heappush(task_scheduler_queue, next_task)  # Re-add task to queue if resources are not available
 
             # Clean up completed futures
             for future in futures[:]:
                 if future.done():
+                    task = future.result()
+                    results.append(task)
                     futures.remove(future)
 
             # Avoid busy waiting
