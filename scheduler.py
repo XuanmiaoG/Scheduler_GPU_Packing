@@ -276,4 +276,3 @@ def main(task_definitions_file, models_dir, results_file):
 
 if __name__ == "__main__":
     main('./task_definitions1.csv', './models', './results.csv')
-
