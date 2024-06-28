@@ -142,23 +142,47 @@ def monitor_scheduler(start_time, task_waitlist, task_scheduler_queue, interval=
         print(f"[Scheduler Runtime Info] Current Time: {current_time / 1000:.2f} seconds, Tasks Remaining: {num_tasks_remaining}")
         time.sleep(interval)
 
-def execute_task(task, models_dir, results_file, scheduler_start_time, high_priority_stream, low_priority_stream):
+def read_task_definitions(csv_file_path):
+    tasks = []
+    with open(csv_file_path, 'r') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            task = Task(row['task_id'], row['model_type'], row['dataset'], row['batch_size'], row['start_time_ms'], row['deadline_ms'], row['data_size'])
+            tasks.append(task)
+    tasks.sort(key=lambda x: x.start_time)  # Sort tasks by start_time
+    return tasks
+
+def create_cuda_streams_with_priorities(priorities, num_streams_per_priority):
+    streams = {}
+    for priority in priorities:
+        streams[priority] = [torch.cuda.Stream(priority=priority) for _ in range(num_streams_per_priority)]
+    return streams
+
+def execute_task(task, models_dir, results_file, scheduler_start_time, streams, stream_priority):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_variant = moea(task, models_dir)
     model_path = os.path.join(models_dir, task.model_type, model_variant)
     model = load_model(model_path, device)
     data_loader = load_data_loader('./data', task.batch_size, task.model_type, task.data_size)
 
-    stream = high_priority_stream if task.priority < 1.0 else low_priority_stream  # Determine the stream based on priority
+    # Determine the stream based on priority
+    stream_pool = streams[stream_priority]
+
+    if not stream_pool:
+        raise RuntimeError("No available CUDA streams.")
+
+    available_stream = stream_pool.pop()  # Get a stream from the pool
 
     start_time = time.time()
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(available_stream):
         with torch.no_grad():
             for images, _ in data_loader:
                 images = images.to(device)
                 _ = model(images)
-    torch.cuda.synchronize(stream)  # Ensure all tasks on the stream are complete
-    elapsed_time = time.time() - (scheduler_start_time + task.start_time/1000)
+    torch.cuda.synchronize(available_stream)  # Ensure all tasks on the stream are complete
+    stream_pool.append(available_stream)  # Return the stream back to the pool
+
+    elapsed_time = time.time() - (scheduler_start_time + task.start_time / 1000)
     elapsed_time_ms = elapsed_time * 1000
     actual_start_time = (start_time - scheduler_start_time) * 1000
     task.missed_deadline = elapsed_time_ms > task.deadline
@@ -184,26 +208,11 @@ def execute_task(task, models_dir, results_file, scheduler_start_time, high_prio
 
     return task  # Return the task after processing
 
-def read_task_definitions(csv_file_path):
-    tasks = []
-    with open(csv_file_path, 'r') as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            task = Task(row['task_id'], row['model_type'], row['dataset'], row['batch_size'], row['start_time_ms'], row['deadline_ms'], row['data_size'])
-            tasks.append(task)
-    tasks.sort(key=lambda x: x.start_time)  # Sort tasks by start_time
-    return tasks
-
-def create_cuda_stream_with_priority(priority):
-    stream = torch.cuda.Stream(priority=priority)
-    return stream
-
 def main(task_definitions_file, models_dir, results_file):
     task_waitlist = read_task_definitions(task_definitions_file)
     task_scheduler_queue = []
     results = []
 
-    # Initialize results file with headers for the task execution results
     # Initialize results file with headers for the task execution results
     with open(results_file, 'w', newline='') as csvfile:
         fieldnames = ['task_id', 'model_type', 'dataset', 'batch_size', 'start_time', 'actual_start_time', 'deadline', 'elapsed_time_ms', 'missed_deadline', 'model_variant', 'data_size']
@@ -213,8 +222,7 @@ def main(task_definitions_file, models_dir, results_file):
     scheduler_start_time = time.time()
 
     # Create high-priority and low-priority CUDA streams
-    high_priority_stream = create_cuda_stream_with_priority(-1)
-    low_priority_stream = create_cuda_stream_with_priority(0)
+    streams = create_cuda_streams_with_priorities([-1, 0], num_streams_per_priority=1)
 
     # Start the monitoring thread
     monitor_thread = threading.Thread(target=monitor_scheduler, args=(scheduler_start_time, task_waitlist, task_scheduler_queue))
@@ -224,6 +232,8 @@ def main(task_definitions_file, models_dir, results_file):
     # Initialize ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers based on your needs
         futures = []
+        current_high_priority_task = None
+
         while task_waitlist or task_scheduler_queue or futures:
             current_time = (time.time() - scheduler_start_time) * 1000  # Convert to milliseconds
 
@@ -234,16 +244,34 @@ def main(task_definitions_file, models_dir, results_file):
 
             # Check GPU resources and execute tasks
             if task_scheduler_queue:
-                next_task = heapq.heappop(task_scheduler_queue)
-                if check_gpu_resources():  # Only execute task if GPU resources are available
-                    futures.append(executor.submit(execute_task, next_task, models_dir, results_file, scheduler_start_time, high_priority_stream, low_priority_stream))
+                if current_high_priority_task is None:
+                    next_task = heapq.heappop(task_scheduler_queue)
+                    if check_gpu_resources():  # Only execute task if GPU resources are available
+                        try:
+                            current_high_priority_task = next_task
+                            futures.append(executor.submit(execute_task, next_task, models_dir, results_file, scheduler_start_time, streams, -1))
+                        except RuntimeError:
+                            heapq.heappush(task_scheduler_queue, next_task)
+                    else:
+                        heapq.heappush(task_scheduler_queue, next_task)  # Re-add task to queue if resources are not available
                 else:
-                    heapq.heappush(task_scheduler_queue, next_task)  # Re-add task to queue if resources are not available
+                    # Try to pack a low priority task
+                    for i in range(len(task_scheduler_queue)):
+                        task = task_scheduler_queue[i]
+                        if task.priority >= current_high_priority_task.priority and check_gpu_resources():
+                            try:
+                                futures.append(executor.submit(execute_task, task, models_dir, results_file, scheduler_start_time, streams, 0))
+                                task_scheduler_queue.pop(i)
+                                break
+                            except RuntimeError:
+                                continue  # Skip this task if no streams are available
 
             # Clean up completed futures
             for future in futures[:]:
                 if future.done():
                     task = future.result()
+                    if task == current_high_priority_task:
+                        current_high_priority_task = None
                     results.append(task)
                     futures.remove(future)
 
