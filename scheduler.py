@@ -62,18 +62,15 @@ def predict_ddl_miss_chance(task, models_dir):
     with open(csv_file_path, 'r') as file:
         reader = csv.DictReader(file)
         for row in reader:
-            # Calculate the inference time for the given data_size
-            total_inference_time = float(row['Inference Time (s)'])
-            total_data_size = 10000  # Total number of images in the CIFAR-10 test set
-            scaled_inference_time = total_inference_time * (task.data_size / total_data_size)
+            # Calculate the inference time for the given data_size using the average single image time
+            avg_single_image_time = float(row['Avg Single Image Time (s)'])
+            total_inference_time = avg_single_image_time * task.data_size
             
-            # Scale inference time with batch size
-            scaled_inference_time *= (task.batch_size / 100)
-
             accuracy = float(row['Accuracy (%)'])
-            miss_chance = max(0, scaled_inference_time - (task.deadline / 1000))  # Convert deadline to seconds
+            miss_chance = max(0, total_inference_time - (task.deadline / 1000))  # Convert deadline to seconds
             models.append({'variant': row['Variant'], 'miss_chance': miss_chance, 'accuracy': accuracy})
     return models
+
 
 def setup_toolbox(models, toolbox):
     max_index = len(models) - 1
@@ -109,7 +106,7 @@ def moea(task, models_dir):
     task.variant = best_model['variant']
     return best_model['variant']
 
-def check_gpu_resources(threshold=0.8):
+def check_gpu_resources(threshold=0.9):
     """
     Checks if the GPU memory and utilization are below the given threshold.
 
@@ -135,11 +132,15 @@ def check_gpu_resources(threshold=0.8):
 def monitor_scheduler(start_time, task_waitlist, task_scheduler_queue, interval=10):
     while True:
         current_time = (time.time() - start_time) * 1000  # Convert to milliseconds
-        while task_waitlist and task_waitlist[0].start_time <= current_time:
-            task = heapq.heappop(task_waitlist)
-            heapq.heappush(task_scheduler_queue, task)
+        for task in task_waitlist[:]:  # Create a copy of the list for safe iteration
+            if task.start_time >= current_time:
+                print(f"Next task start time: {task.start_time}, current time: {current_time}")
+                print(f"Task info: {task}")
+            if task.start_time <= current_time:
+                task_scheduler_queue.append(task)
+                task_waitlist.remove(task)
         num_tasks_remaining = len(task_scheduler_queue)
-        print(f"[Scheduler Runtime Info] Current Time: {current_time / 1000:.2f} seconds, Tasks Remaining: {num_tasks_remaining}")
+        print(f"[Scheduler Runtime Info] Current Time: {current_time / 1000:.2f} seconds, Tasks Remaining: {num_tasks_remaining}, Tasks Wait: {len(task_waitlist)}")
         time.sleep(interval)
 
 def read_task_definitions(csv_file_path):
@@ -147,16 +148,17 @@ def read_task_definitions(csv_file_path):
     with open(csv_file_path, 'r') as file:
         reader = csv.DictReader(file)
         for row in reader:
-            task = Task(row['task_id'], row['model_type'], row['dataset'], row['batch_size'], row['start_time_ms'], row['deadline_ms'], row['data_size'])
+            start_time = int(row['start_time_ms'])
+            if start_time > 1e12:  # Assuming 1e12 as a threshold for invalid start time
+                start_time = 0  # Resetting invalid start time to 0
+            task = Task(row['task_id'], row['model_type'], row['dataset'], row['batch_size'], start_time, row['deadline_ms'], row['data_size'])
             tasks.append(task)
-    tasks.sort(key=lambda x: x.start_time)  # Sort tasks by start_time
     return tasks
 
-def create_cuda_streams_with_priorities(priorities, num_streams_per_priority):
-    streams = {}
-    for priority in priorities:
-        streams[priority] = [torch.cuda.Stream(priority=priority) for _ in range(num_streams_per_priority)]
-    return streams
+def create_cuda_streams():
+    high_priority_stream = torch.cuda.Stream(priority=-1)
+    low_priority_stream = torch.cuda.Stream(priority=0)
+    return high_priority_stream, low_priority_stream
 
 def execute_task(task, models_dir, results_file, scheduler_start_time, streams, stream_priority):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,22 +167,15 @@ def execute_task(task, models_dir, results_file, scheduler_start_time, streams, 
     model = load_model(model_path, device)
     data_loader = load_data_loader('./data', task.batch_size, task.model_type, task.data_size)
 
-    # Determine the stream based on priority
-    stream_pool = streams[stream_priority]
-
-    if not stream_pool:
-        raise RuntimeError("No available CUDA streams.")
-
-    available_stream = stream_pool.pop()  # Get a stream from the pool
+    stream = streams[stream_priority]
 
     start_time = time.time()
-    with torch.cuda.stream(available_stream):
+    with torch.cuda.stream(stream):
         with torch.no_grad():
             for images, _ in data_loader:
                 images = images.to(device)
                 _ = model(images)
-    torch.cuda.synchronize(available_stream)  # Ensure all tasks on the stream are complete
-    stream_pool.append(available_stream)  # Return the stream back to the pool
+    torch.cuda.synchronize(stream)  # Ensure all tasks on the stream are complete
 
     elapsed_time = time.time() - (scheduler_start_time + task.start_time / 1000)
     elapsed_time_ms = elapsed_time * 1000
@@ -198,6 +193,7 @@ def execute_task(task, models_dir, results_file, scheduler_start_time, streams, 
         'elapsed_time_ms': elapsed_time_ms,
         'missed_deadline': task.missed_deadline,
         'model_variant': model_variant,
+        'model_variant': model_variant,
         'data_size': task.data_size
     }
 
@@ -207,12 +203,19 @@ def execute_task(task, models_dir, results_file, scheduler_start_time, streams, 
         writer.writerow(results)
 
     return task  # Return the task after processing
+def print_task_waitlist(task_waitlist):
+    print("Task Waitlist:")
+    for task in task_waitlist:
+        print(f"Task ID: {task.task_id}, Start Time: {task.start_time}, Priority: {task.priority}")
+    
 
 def main(task_definitions_file, models_dir, results_file):
     task_waitlist = read_task_definitions(task_definitions_file)
+    print_task_waitlist(task_waitlist)  # Print task waitlist for debugging
     task_scheduler_queue = []
     results = []
-
+    # Print the task waitlist
+    print_task_waitlist(task_waitlist)
     # Initialize results file with headers for the task execution results
     with open(results_file, 'w', newline='') as csvfile:
         fieldnames = ['task_id', 'model_type', 'dataset', 'batch_size', 'start_time', 'actual_start_time', 'deadline', 'elapsed_time_ms', 'missed_deadline', 'model_variant', 'data_size']
@@ -222,7 +225,8 @@ def main(task_definitions_file, models_dir, results_file):
     scheduler_start_time = time.time()
 
     # Create high-priority and low-priority CUDA streams
-    streams = create_cuda_streams_with_priorities([-1, 0], num_streams_per_priority=1)
+    high_priority_stream, low_priority_stream = create_cuda_streams()
+    streams = {-1: high_priority_stream, 0: low_priority_stream}
 
     # Start the monitoring thread
     monitor_thread = threading.Thread(target=monitor_scheduler, args=(scheduler_start_time, task_waitlist, task_scheduler_queue))
@@ -230,7 +234,7 @@ def main(task_definitions_file, models_dir, results_file):
     monitor_thread.start()
 
     # Initialize ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers based on your needs
+    with ThreadPoolExecutor(max_workers=8) as executor:  # Adjust max_workers based on your needs
         futures = []
         current_high_priority_task = None
 
@@ -238,9 +242,9 @@ def main(task_definitions_file, models_dir, results_file):
             current_time = (time.time() - scheduler_start_time) * 1000  # Convert to milliseconds
 
             # Move tasks from waitlist to scheduler queue
-            while task_waitlist and task_waitlist[0].start_time <= current_time:
-                task = heapq.heappop(task_waitlist)
-                heapq.heappush(task_scheduler_queue, task)
+            # while task_waitlist and task_waitlist[0].start_time <= current_time:
+            #     task = heapq.heappop(task_waitlist)
+            #     heapq.heappush(task_scheduler_queue, task)
 
             # Check GPU resources and execute tasks
             if task_scheduler_queue:
